@@ -1,8 +1,3 @@
-// Audio Spectrum Display
-// Copyright 2013 Tony DiCola (tony@tonydicola.com)
-
-// This code is part of the guide at http://learn.adafruit.com/fft-fun-with-fourier-transforms/
-
 #define ARM_MATH_CM4
 #include <arm_math.h>
 #include <Adafruit_NeoPixel.h>
@@ -14,7 +9,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 int SAMPLE_RATE_HZ = 9000;             // Sample rate of the audio in hertz.
-float SPECTRUM_MIN_DB = 38.25;          // Audio intensity (in decibels) that maps to low LED brightness.
+float SPECTRUM_MIN_DB = 38.5;          // Audio intensity (in decibels) that maps to low LED brightness.
 float SPECTRUM_MAX_DB = 300.0;          // Audio intensity (in decibels) that maps to high LED brightness.
 int LEDS_ENABLED = 1;                  // Control if the LED's should display the spectrum or not.  1 is true, 0 is false.
                                        // Useful for turning the LED display on and off with commands from the serial port.
@@ -25,10 +20,12 @@ const int ANALOG_READ_RESOLUTION = 10; // Bits of resolution for the ADC.
 const int ANALOG_READ_AVERAGING = 16;  // Number of samples to average with each ADC reading.
 const int POWER_LED_PIN = 13;          // Output pin for power LED (pin 13 to use Teensy 3.0's onboard LED).
 const int NEO_PIXEL_PIN = 3;           // Output pin for neo pixels.
-const int NEO_PIXEL_COUNT = 5;         // Number of neo pixels.  You should be able to increase this without
+const int NEO_PIXEL_COUNT = 16;         // Number of neo pixels.  You should be able to increase this without
                                        // any other changes to the program.
-const float MAX_BRIGHTNESS = 1.0;
-const float MIN_BRIGHTNESS = 0.25;
+const bool USE_MIN_BRIGHTNESS = true;                                      
+const float MIN_BRIGHTNESS_BASE = 0.01;
+const bool RANDOMIZE_INTENSITY_INDEX = true;
+const bool USE_RAINBOW = false;
 
 ////////////////////////////////////////////////////////////////////////////////
 // INTERNAL STATE
@@ -40,18 +37,20 @@ float samples[FFT_SIZE*2];
 float magnitudes[FFT_SIZE];
 int sampleCounter = 0;
 Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NEO_PIXEL_COUNT, NEO_PIXEL_PIN, NEO_GRB + NEO_KHZ800);
-char commandBuffer[MAX_CHARS];
 float frequencyWindow[NEO_PIXEL_COUNT+1];
 float hues[NEO_PIXEL_COUNT];
+float rainbowEndIndex = float(NEO_PIXEL_COUNT);
 
-
+float baseHue;
+  
 ////////////////////////////////////////////////////////////////////////////////
 // MAIN SKETCH FUNCTIONS
 ////////////////////////////////////////////////////////////////////////////////
 
 void setup() {
   // Set up serial port.
-  Serial.begin(38400);
+  randomSeed(analogRead(0));
+  baseHue = float(random(360));
   
   // Set up ADC and audio input.
   pinMode(AUDIO_INPUT_PIN, INPUT);
@@ -66,9 +65,6 @@ void setup() {
   // Initialize neo pixel library and turn off the LEDs
   pixels.begin();
   pixels.show(); 
-  
-  // Clear the input command buffer
-  memset(commandBuffer, 0, sizeof(commandBuffer));
   
   // Initialize spectrum display
   spectrumSetup();
@@ -129,7 +125,6 @@ int frequencyToBin(float frequency) {
 // Convert from HSV values (in floating point 0 to 1.0) to RGB colors usable
 // by neo pixel functions.
 uint32_t pixelHSVtoRGBColor(float hue, float saturation, float value) {
-  // Implemented from algorithm at http://en.wikipedia.org/wiki/HSL_and_HSV#From_HSV
   float chroma = value * saturation;
   float h1 = float(hue)/60.0;
   float x = chroma*(1.0-fabs(fmod(h1, 2.0)-1.0));
@@ -165,6 +160,7 @@ uint32_t pixelHSVtoRGBColor(float hue, float saturation, float value) {
   r += m;
   g += m;
   b += m;
+  
   return pixels.Color(int(255*r), int(255*g), int(255*b));
 }
 
@@ -180,9 +176,11 @@ void spectrumSetup() {
   for (int i = 0; i < NEO_PIXEL_COUNT+1; ++i) {
     frequencyWindow[i] = i*windowSize;
   }
-  // Evenly spread hues across all pixels.
-  for (int i = 0; i < NEO_PIXEL_COUNT; ++i) {
-    hues[i] = 360.0*(float(i)/float(NEO_PIXEL_COUNT-1));
+
+  if (USE_RAINBOW) {
+    rainbowHues();  
+  } else {
+    uniformHues();
   }
 }
 
@@ -203,11 +201,33 @@ void spectrumLoop() {
     intensity = intensity < 0.0 ? 0.0 : intensity;
     intensity /= (SPECTRUM_MAX_DB-SPECTRUM_MIN_DB);
     intensity = intensity > 1.0 ? 1.0 : intensity;
-    pixels.setPixelColor(i, pixelHSVtoRGBColor(hues[i], 1.0, intensity));
+    
+    if (USE_MIN_BRIGHTNESS) {
+      float variantIntensity = MIN_BRIGHTNESS_BASE + float(random(-3, 4) / 1000.0);
+      intensity = intensity < MIN_BRIGHTNESS_BASE ? variantIntensity : intensity; 
+    }
+     
+    int randomIndex = RANDOMIZE_INTENSITY_INDEX ? random(i, NEO_PIXEL_COUNT): i;
+//    pixels.setPixelColor(i, pixelHSVtoRGBColor(0, 0, 0)); // reset all pixels before setting new colors.
+    pixels.setPixelColor(randomIndex, pixelHSVtoRGBColor(hues[i], 1.0, intensity));
   }
   pixels.show();
 }
 
+// Evenly spread hues across all pixels.
+void rainbowHues() {
+  for (int i = 0; i < NEO_PIXEL_COUNT; ++i) {
+    float pixelIndex = float(i);
+    hues[i] = 360.0 * (pixelIndex / rainbowEndIndex);
+  }
+}
+
+void uniformHues() {
+  for (int i = 0; i < NEO_PIXEL_COUNT; ++i) {
+    float variant = baseHue + float(random(-49, 50));
+    hues[i] = variant;
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // SAMPLING FUNCTIONS
