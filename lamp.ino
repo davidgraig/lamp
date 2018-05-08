@@ -1,153 +1,237 @@
-/*
-LED VU meter for Arduino and Adafruit NeoPixel LEDs.
+// Audio Spectrum Display
+// Copyright 2013 Tony DiCola (tony@tonydicola.com)
 
-Hardware requirements:
- - Most Arduino or Arduino-compatible boards (ATmega 328P or better).
- - Adafruit Electret Microphone Amplifier (ID: 1063)
- - Adafruit Flora RGB Smart Pixels (ID: 1260)
-   OR
- - Adafruit NeoPixel Digital LED strip (ID: 1138)
- - Optional: battery for portable use (else power through USB or adapter)
-Software requirements:
- - Adafruit NeoPixel library
+// This code is part of the guide at http://learn.adafruit.com/fft-fun-with-fourier-transforms/
 
-Connections:
- - 3.3V to mic amp +
- - GND to mic amp -
- - Analog pin to microphone output (configurable below)
- - Digital pin to LED data input (configurable below)
- See notes in setup() regarding 5V vs. 3.3V boards - there may be an
- extra connection to make and one line of code to enable or disable.
-
-Written by Adafruit Industries.  Distributed under the BSD license.
-This paragraph must be included in any redistribution.
-*/
-
+#define ARM_MATH_CM4
+#include <arm_math.h>
 #include <Adafruit_NeoPixel.h>
 
-#define N_PIXELS 16        // Number of pixels in strand
-#define MIC_PIN A10        // Microphone is attached to this analog pin
-#define LED_PIN 6          // NeoPixel LED strand is connected to this pin
-#define DC_OFFSET 0        // DC offset in mic signal - if unusure, leave 0
-#define NOISE 10           // Noise/hum/interference in mic signal
-#define SAMPLES 60         // Length of buffer for dynamic level adjustment
-#define TOP (N_PIXELS) // Allow dot to go slightly off scale
-#define PEAK_FALL 40       // Rate of peak falling dot
-#define BRIGHTNESS 10
 
-byte
-    peak = 0,     // Used for falling dot
-    dotCount = 0, // Frame counter for delaying dot-falling speed
-    volCount = 0; // Frame counter for storing past volume data
-int
-    vol[SAMPLES],  // Collection of prior volume samples
-    lvl = 10,      // Current "dampened" audio level
-    minLvlAvg = 0, // For dynamic adjustment of graph low & high
-    maxLvlAvg = 512;
-Adafruit_NeoPixel
-    strip = Adafruit_NeoPixel(N_PIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+////////////////////////////////////////////////////////////////////////////////
+// CONIFIGURATION 
+// These values can be changed to alter the behavior of the spectrum display.
+////////////////////////////////////////////////////////////////////////////////
 
-void setup()
-{
+int SAMPLE_RATE_HZ = 9000;             // Sample rate of the audio in hertz.
+float SPECTRUM_MIN_DB = 38.25;          // Audio intensity (in decibels) that maps to low LED brightness.
+float SPECTRUM_MAX_DB = 300.0;          // Audio intensity (in decibels) that maps to high LED brightness.
+int LEDS_ENABLED = 1;                  // Control if the LED's should display the spectrum or not.  1 is true, 0 is false.
+                                       // Useful for turning the LED display on and off with commands from the serial port.
+const int FFT_SIZE = 256;              // Size of the FFT.  Realistically can only be at most 256 
+                                       // without running out of memory for buffers and other state.
+const int AUDIO_INPUT_PIN = 14;        // Input ADC pin for audio data.
+const int ANALOG_READ_RESOLUTION = 10; // Bits of resolution for the ADC.
+const int ANALOG_READ_AVERAGING = 16;  // Number of samples to average with each ADC reading.
+const int POWER_LED_PIN = 13;          // Output pin for power LED (pin 13 to use Teensy 3.0's onboard LED).
+const int NEO_PIXEL_PIN = 3;           // Output pin for neo pixels.
+const int NEO_PIXEL_COUNT = 5;         // Number of neo pixels.  You should be able to increase this without
+                                       // any other changes to the program.
+const float MAX_BRIGHTNESS = 1.0;
+const float MIN_BRIGHTNESS = 0.25;
 
-  // This is only needed on 5V Arduinos (Uno, Leonardo, etc.).
-  // Connect 3.3V to mic AND TO AREF ON ARDUINO and enable this
-  // line.  Audio samples are 'cleaner' at 3.3V.
-  // COMMENT OUT THIS LINE FOR 3.3V ARDUINOS (FLORA, ETC.):
-  //  analogReference(EXTERNAL);
-  Serial.begin(9600); // open the serial port at 9600 bps:
-  memset(vol, 0, sizeof(vol));
-  strip.begin();
+////////////////////////////////////////////////////////////////////////////////
+// INTERNAL STATE
+// These shouldn't be modified unless you know what you're doing.
+////////////////////////////////////////////////////////////////////////////////
+
+IntervalTimer samplingTimer;
+float samples[FFT_SIZE*2];
+float magnitudes[FFT_SIZE];
+int sampleCounter = 0;
+Adafruit_NeoPixel pixels = Adafruit_NeoPixel(NEO_PIXEL_COUNT, NEO_PIXEL_PIN, NEO_GRB + NEO_KHZ800);
+char commandBuffer[MAX_CHARS];
+float frequencyWindow[NEO_PIXEL_COUNT+1];
+float hues[NEO_PIXEL_COUNT];
+
+
+////////////////////////////////////////////////////////////////////////////////
+// MAIN SKETCH FUNCTIONS
+////////////////////////////////////////////////////////////////////////////////
+
+void setup() {
+  // Set up serial port.
+  Serial.begin(38400);
+  
+  // Set up ADC and audio input.
+  pinMode(AUDIO_INPUT_PIN, INPUT);
+  analogReadResolution(ANALOG_READ_RESOLUTION);
+  analogReadAveraging(ANALOG_READ_AVERAGING);
+  
+  // Turn on the power indicator LED.
+  pinMode(POWER_LED_PIN, OUTPUT);
+  digitalWrite(POWER_LED_PIN, HIGH);
+  delay(1000);
+  digitalWrite(POWER_LED_PIN, LOW);
+  // Initialize neo pixel library and turn off the LEDs
+  pixels.begin();
+  pixels.show(); 
+  
+  // Clear the input command buffer
+  memset(commandBuffer, 0, sizeof(commandBuffer));
+  
+  // Initialize spectrum display
+  spectrumSetup();
+  
+  // Begin sampling audio
+  samplingBegin();
 }
 
-void loop()
-{
-  uint8_t i;
-  uint16_t minLvl, maxLvl;
-  int n, height;
-
-  n = analogRead(MIC_PIN); // Raw reading from mic
-  Serial.println(n);
-  n = abs(n - 512 - DC_OFFSET);       // Center on zero
-  n = (n <= NOISE) ? 0 : (n - NOISE); // Remove noise/hum
-  lvl = ((lvl * 7) + n) >> 3;         // "Dampened" reading (else looks twitchy)
-
-  // Calculate bar height based on dynamic min/max levels (fixed point):
-  height = TOP * (lvl - minLvlAvg) / (long)(maxLvlAvg - minLvlAvg);
-
-  if (height < 0L)
-    height = 0; // Clip output
-  else if (height > TOP)
-    height = TOP;
-  if (height > peak)
-    peak = height; // Keep 'peak' dot at top
-
-  // Color pixels based on rainbow gradient
-  for (i = 0; i < N_PIXELS; i++)
-  {
-    if (i >= height)
-      strip.setPixelColor(i, 0, 0, 0);
-    else
-      strip.setPixelColor(i, Wheel(map(i, 0, strip.numPixels() - 1, 30, 150)));
+void loop() {
+  // Calculate FFT if a full sample is available.
+  if (samplingIsDone()) {
+    // Run FFT on sample data.
+    arm_cfft_radix4_instance_f32 fft_inst;
+    arm_cfft_radix4_init_f32(&fft_inst, FFT_SIZE, 0, 1);
+    arm_cfft_radix4_f32(&fft_inst, samples);
+    // Calculate magnitude of complex numbers output by the FFT.
+    arm_cmplx_mag_f32(samples, magnitudes, FFT_SIZE);
+  
+    if (LEDS_ENABLED == 1)
+    {
+      spectrumLoop();
+    }
+  
+    // Restart audio sampling.
+    samplingBegin();
   }
-
-  // Draw peak dot
-  if (peak > 0 && peak <= N_PIXELS - 1)
-    strip.setPixelColor(peak, Wheel(map(peak, 0, strip.numPixels() - 1, 30, 150)));
-
-  strip.show(); // Update strip
-
-  // Every few frames, make the peak pixel drop by 1:
-
-  if (++dotCount >= PEAK_FALL)
-  { //fall rate
-
-    if (peak > 0)
-      peak--;
-    dotCount = 0;
-  }
-
-  vol[volCount] = n; // Save sample for dynamic leveling
-  if (++volCount >= SAMPLES)
-    volCount = 0; // Advance/rollover sample counter
-
-  // Get volume range of prior frames
-  minLvl = maxLvl = vol[0];
-  for (i = 1; i < SAMPLES; i++)
-  {
-    if (vol[i] < minLvl)
-      minLvl = vol[i];
-    else if (vol[i] > maxLvl)
-      maxLvl = vol[i];
-  }
-  // minLvl and maxLvl indicate the volume range over prior frames, used
-  // for vertically scaling the output graph (so it looks interesting
-  // regardless of volume level).  If they're too close together though
-  // (e.g. at very low volume levels) the graph becomes super coarse
-  // and 'jumpy'...so keep some minimum distance between them (this
-  // also lets the graph go to zero when no sound is playing):
-  if ((maxLvl - minLvl) < TOP)
-    maxLvl = minLvl + TOP;
-  minLvlAvg = (minLvlAvg * 63 + minLvl) >> 6; // Dampen min/max levels
-  maxLvlAvg = (maxLvlAvg * 63 + maxLvl) >> 6; // (fake rolling average)
 }
 
-// Input a value 0 to 255 to get a color value.
-// The colors are a transition r - g - b - back to r.
-uint32_t Wheel(byte WheelPos)
-{
-  if (WheelPos < 85)
-  {
-    return strip.Color(BRIGHTNESS * (WheelPos * 3) / 255, BRIGHTNESS * (255 - WheelPos * 3) / 255, 0);
+
+////////////////////////////////////////////////////////////////////////////////
+// UTILITY FUNCTIONS
+////////////////////////////////////////////////////////////////////////////////
+
+// Compute the average magnitude of a target frequency window vs. all other frequencies.
+void windowMean(float* magnitudes, int lowBin, int highBin, float* windowMean, float* otherMean) {
+    *windowMean = 0;
+    *otherMean = 0;
+    // Notice the first magnitude bin is skipped because it represents the
+    // average power of the signal.
+    for (int i = 1; i < FFT_SIZE/2; ++i) {
+      if (i >= lowBin && i <= highBin) {
+        *windowMean += magnitudes[i];
+      }
+      else {
+        *otherMean += magnitudes[i];
+      }
+    }
+    *windowMean /= (highBin - lowBin) + 1;
+    *otherMean /= (FFT_SIZE / 2 - (highBin - lowBin));
+}
+
+// Convert a frequency to the appropriate FFT bin it will fall within.
+int frequencyToBin(float frequency) {
+  float binFrequency = float(SAMPLE_RATE_HZ) / float(FFT_SIZE);
+  return int(frequency / binFrequency);
+}
+
+// Convert from HSV values (in floating point 0 to 1.0) to RGB colors usable
+// by neo pixel functions.
+uint32_t pixelHSVtoRGBColor(float hue, float saturation, float value) {
+  // Implemented from algorithm at http://en.wikipedia.org/wiki/HSL_and_HSV#From_HSV
+  float chroma = value * saturation;
+  float h1 = float(hue)/60.0;
+  float x = chroma*(1.0-fabs(fmod(h1, 2.0)-1.0));
+  float r = 0;
+  float g = 0;
+  float b = 0;
+  if (h1 < 1.0) {
+    r = chroma;
+    g = x;
   }
-  else if (WheelPos < 170)
-  {
-    WheelPos -= 85;
-    return strip.Color(BRIGHTNESS * (255 - WheelPos * 3) / 255, 0, BRIGHTNESS * (WheelPos * 3) / 255);
+  else if (h1 < 2.0) {
+    r = x;
+    g = chroma;
   }
-  else
-  {
-    WheelPos -= 170;
-    return strip.Color(0, BRIGHTNESS * (WheelPos * 3) / 255, BRIGHTNESS * (255 - WheelPos * 3) / 255);
+  else if (h1 < 3.0) {
+    g = chroma;
+    b = x;
   }
+  else if (h1 < 4.0) {
+    g = x;
+    b = chroma;
+  }
+  else if (h1 < 5.0) {
+    r = x;
+    b = chroma;
+  }
+  else // h1 <= 6.0
+  {
+    r = chroma;
+    b = x;
+  }
+  float m = value - chroma;
+  r += m;
+  g += m;
+  b += m;
+  return pixels.Color(int(255*r), int(255*g), int(255*b));
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// SPECTRUM DISPLAY FUNCTIONS
+///////////////////////////////////////////////////////////////////////////////
+
+void spectrumSetup() {
+  // Set the frequency window values by evenly dividing the possible frequency
+  // spectrum across the number of neo pixels.
+  float windowSize = (SAMPLE_RATE_HZ / 2.0) / float(NEO_PIXEL_COUNT);
+  for (int i = 0; i < NEO_PIXEL_COUNT+1; ++i) {
+    frequencyWindow[i] = i*windowSize;
+  }
+  // Evenly spread hues across all pixels.
+  for (int i = 0; i < NEO_PIXEL_COUNT; ++i) {
+    hues[i] = 360.0*(float(i)/float(NEO_PIXEL_COUNT-1));
+  }
+}
+
+void spectrumLoop() {
+  // Update each LED based on the intensity of the audio 
+  // in the associated frequency window.
+  float intensity, otherMean;
+  for (int i = 0; i < NEO_PIXEL_COUNT; ++i) {
+    windowMean(magnitudes, 
+               frequencyToBin(frequencyWindow[i]),
+               frequencyToBin(frequencyWindow[i+1]),
+               &intensity,
+               &otherMean);
+    // Convert intensity to decibels.
+    intensity = 20.0*log10(intensity);
+    // Scale the intensity and clamp between 0 and 1.0.
+    intensity -= SPECTRUM_MIN_DB;
+    intensity = intensity < 0.0 ? 0.0 : intensity;
+    intensity /= (SPECTRUM_MAX_DB-SPECTRUM_MIN_DB);
+    intensity = intensity > 1.0 ? 1.0 : intensity;
+    pixels.setPixelColor(i, pixelHSVtoRGBColor(hues[i], 1.0, intensity));
+  }
+  pixels.show();
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// SAMPLING FUNCTIONS
+////////////////////////////////////////////////////////////////////////////////
+
+void samplingCallback() {
+  // Read from the ADC and store the sample data
+  samples[sampleCounter] = (float32_t)analogRead(AUDIO_INPUT_PIN);
+  // Complex FFT functions require a coefficient for the imaginary part of the input.
+  // Since we only have real data, set this coefficient to zero.
+  samples[sampleCounter+1] = 0.0;
+  // Update sample buffer position and stop after the buffer is filled
+  sampleCounter += 2;
+  if (sampleCounter >= FFT_SIZE*2) {
+    samplingTimer.end();
+  }
+}
+
+void samplingBegin() {
+  // Reset sample buffer position and start callback at necessary rate.
+  sampleCounter = 0;
+  samplingTimer.begin(samplingCallback, 1000000/SAMPLE_RATE_HZ);
+}
+
+boolean samplingIsDone() {
+  return sampleCounter >= FFT_SIZE*2;
 }
